@@ -8,6 +8,7 @@
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/iopoll.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -265,6 +266,9 @@ struct dw_mipi_dsi2 {
 	int irq;
 	int id;
 
+	struct gpio_desc *reset_gpio;
+	struct gpio_desc *enable_gpio;
+
 	/* dual-channel */
 	struct dw_mipi_dsi2 *master;
 	struct dw_mipi_dsi2 *slave;
@@ -325,6 +329,32 @@ static void grf_field_write(struct dw_mipi_dsi2 *dsi2, enum grf_reg_fields index
 	msb = (field >>  0) & 0xff;
 
 	regmap_write(dsi2->grf, reg, (val << lsb) | (GENMASK(msb, lsb) << 16));
+}
+
+static void dsi_external_bridge_power_on(struct dw_mipi_dsi2 *dsi2)
+{
+	DRM_DEV_INFO(dsi2->dev, "start DSI-link external bridge power reset\n");
+
+	if (dsi2->enable_gpio) {
+		gpiod_direction_output(dsi2->enable_gpio, 1);
+		usleep_range(1000, 2000);
+	}
+
+	if (dsi2->reset_gpio) {
+		gpiod_direction_output(dsi2->reset_gpio, 1);
+		usleep_range(20000, 25000);
+		gpiod_direction_output(dsi2->reset_gpio, 0);
+		usleep_range(20000, 25000); /* tune here */
+	}
+}
+
+static void dsi_external_bridge_power_off(struct dw_mipi_dsi2 *dsi2)
+{
+	if (dsi2->enable_gpio)
+		gpiod_direction_output(dsi2->enable_gpio, 0);
+
+	if (dsi2->reset_gpio)
+		gpiod_direction_output(dsi2->reset_gpio, 1);
 }
 
 static int dw_mipi_dsi2_is_cmd_mode(struct dw_mipi_dsi2 *dsi2)
@@ -518,6 +548,8 @@ static void dw_mipi_dsi2_encoder_atomic_disable(struct drm_encoder *encoder,
 		if (dsi2->panel)
 			drm_panel_disable(dsi2->panel);
 	}
+
+	dsi_external_bridge_power_off(dsi2);
 
 	if (dw_mipi_dsi2_is_cmd_mode(dsi2))
 		rockchip_drm_crtc_standby(encoder->crtc, 1);
@@ -1040,6 +1072,8 @@ static void dw_mipi_dsi2_encoder_atomic_enable(struct drm_encoder *encoder,
 		dev_err(dsi2->dev, "failed to set dsi2 mode\n");
 		return;
 	}
+
+	dsi_external_bridge_power_on(dsi2);
 
 	dw_mipi_dsi2_get_lane_rate(dsi2);
 
@@ -2001,6 +2035,20 @@ static int dw_mipi_dsi2_probe(struct platform_device *pdev)
 	if (IS_ERR(dsi2->dcphy)) {
 		ret = PTR_ERR(dsi2->dcphy);
 		DRM_DEV_ERROR(dev, "failed to get mipi dcphy: %d\n", ret);
+		return ret;
+	}
+
+	dsi2->enable_gpio = devm_gpiod_get_optional(dev, "enable", 0);
+	if (IS_ERR(dsi2->enable_gpio)) {
+		ret = PTR_ERR(dsi2->enable_gpio);
+		dev_err(dev, "failed to request enable GPIO: %d\n", ret);
+		return ret;
+	}
+
+	dsi2->reset_gpio = devm_gpiod_get_optional(dev, "reset", 0);
+	if (IS_ERR(dsi2->reset_gpio)) {
+		ret = PTR_ERR(dsi2->reset_gpio);
+		dev_err(dev, "failed to request reset GPIO: %d\n", ret);
 		return ret;
 	}
 

@@ -17,6 +17,7 @@
 #include <linux/rtc.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/err.h>
 
@@ -200,16 +201,18 @@ static int pcf8563_rtc_read_time(struct device *dev, struct rtc_time *tm)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct pcf8563 *pcf8563 = i2c_get_clientdata(client);
 	unsigned char buf[9];
-	int err;
+	int err, retry = 0;
 
+rtc_retry:
 	err = pcf8563_read_block_data(client, PCF8563_REG_ST1, 9, buf);
-	if (err)
-		return err;
+	if (err){
+		udelay(500); /* wait for bus stable */
+		err = pcf8563_read_block_data(client, PCF8563_REG_ST1, 9, buf);
+	}
 
 	if (buf[PCF8563_REG_SC] & PCF8563_SC_LV) {
-		dev_err(&client->dev,
+		dev_info(&client->dev,
 			"low voltage detected, date/time is not reliable.\n");
-		return -EINVAL;
 	}
 
 	dev_dbg(&client->dev,
@@ -237,6 +240,12 @@ static int pcf8563_rtc_read_time(struct device *dev, struct rtc_time *tm)
 		__func__,
 		tm->tm_sec, tm->tm_min, tm->tm_hour,
 		tm->tm_mday, tm->tm_mon, tm->tm_year, tm->tm_wday);
+
+	if (rtc_valid_tm(tm) < 0 && retry++ < 5) {
+		dev_err(&client->dev, "retrieved date/time invalid retry %d\n", retry);
+		udelay(500);
+		goto rtc_retry;
+	}
 
 	return 0;
 }
@@ -528,6 +537,10 @@ static int pcf8563_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, pcf8563);
 	pcf8563->client = client;
 	device_set_wakeup_capable(&client->dev, 1);
+
+	/* A psudeo read for first access failure workaround!
+	 */
+	pcf8563_read_block_data(client, PCF8563_REG_ST1, 1, &buf);
 
 	/* Set timer to lowest frequency to save power (ref Haoyu datasheet) */
 	buf = PCF8563_TMRC_1_60;
